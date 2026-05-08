@@ -6,7 +6,7 @@
 //! All steps are idempotent: re-running `install` is a no-op for parts
 //! that are already in place. `uninstall` reverses each step.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use serde_json::{json, Value};
@@ -62,13 +62,6 @@ impl StepStatus {
             Self::Added => "✓",
             Self::Skipped => "·",
             Self::Failed(_) => "✗",
-        }
-    }
-    fn note(&self) -> String {
-        match self {
-            Self::Added => "added".into(),
-            Self::Skipped => "already present".into(),
-            Self::Failed(e) => format!("failed: {e}"),
         }
     }
 }
