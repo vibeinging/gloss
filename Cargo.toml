@@ -1,0 +1,40 @@
+[package]
+name = "gloss"
+version = "0.0.1"
+edition = "2021"
+description = "Out-of-tree git checkpoints for AI coding agents."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "gloss"
+path = "src/main.rs"
+
+[lib]
+name = "gloss"
+path = "src/lib.rs"
+
+[dependencies]
+# Core engine
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+dirs = "5"
+log = "0.4"
+
+# CLI (M2)
+clap = { version = "4", features = ["derive"] }
+
+# Daemon (M3) — to be wired in
+# notify = "6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "signal", "io-std", "io-util", "time"] }
+
+# Web UI (M4)
+axum = "0.7"
+
+# MCP server (M5) — uncomment once we have a stable rmcp version
+# rmcp = "0.x"
+
+[dev-dependencies]
+serial_test = "3"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
