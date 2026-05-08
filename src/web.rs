@@ -213,15 +213,6 @@ fn render_page(
     out.push_str(CSS);
     out.push_str("</style></head><body>");
 
-    let badge = match label {
-        Some(l) => format!("<span class=\"badge\">{}</span>", esc(l)),
-        None => String::new(),
-    };
-    out.push_str(&format!(
-        "<header><h1>gloss</h1>{badge}<div class=\"ws\">{}</div></header>",
-        esc(&workspace.display().to_string())
-    ));
-
     if let Some(m) = flash {
         out.push_str(&format!("<div class=\"flash\">{}</div>", esc(m)));
     }
@@ -229,6 +220,25 @@ fn render_page(
     out.push_str("<div class=\"layout\">");
 
     out.push_str("<aside>");
+
+    // Project identity — replaces the old top-spanning header.
+    let basename = workspace
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(".");
+    let full = workspace.display().to_string();
+    let pretty_path = dirs::home_dir()
+        .and_then(|h| h.to_str().map(String::from))
+        .filter(|h| full.starts_with(h))
+        .map(|h| format!("~{}", &full[h.len()..]))
+        .unwrap_or_else(|| full.clone());
+    out.push_str(&format!(
+        "<div class=\"project\" title=\"{}\"><div class=\"proj-name\">gloss · {}</div><div class=\"proj-path\">{}</div></div>",
+        esc(&full),
+        esc(basename),
+        esc(&pretty_path),
+    ));
+    let _ = label; // browser tab <title> still uses it; no in-page badge any more.
 
     // Session tabs at the top of the sidebar. Each tab represents a burst
     // of activity (>30min idle = new session). Click to filter the
@@ -413,12 +423,11 @@ fn urlencode(s: &str) -> String {
 const CSS: &str = r#"
 * { box-sizing: border-box; }
 body { margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; color: #1f2328; background: #f6f8fa; }
-header { padding: 12px 20px; background: #24292f; color: #fff; display: flex; align-items: baseline; gap: 16px; }
-header h1 { margin: 0; font-size: 16px; font-weight: 600; }
-header .badge { background: #2da44e; color: #fff; padding: 2px 10px; border-radius: 10px; font-size: 12px; font-weight: 600; }
-header .ws { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; opacity: 0.7; }
 .flash { padding: 10px 20px; background: #ddf4ff; border-bottom: 1px solid #b6e3ff; color: #0969da; }
-.layout { display: grid; grid-template-columns: 320px 1fr; height: calc(100vh - 45px); }
+.layout { display: grid; grid-template-columns: 320px 1fr; height: 100vh; }
+.project { padding: 14px 14px 12px; border-bottom: 1px solid #d1d9e0; flex-shrink: 0; }
+.proj-name { font-weight: 700; font-size: 14px; color: #1f2328; }
+.proj-path { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; color: #8c959f; margin-top: 3px; word-break: break-all; }
 aside { background: #fff; border-right: 1px solid #d1d9e0; overflow-y: auto; display: flex; flex-direction: column; }
 aside h2 { margin: 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #59636e; }
 .session-tabs { display: flex; flex-direction: column; padding: 6px; gap: 3px; border-bottom: 1px solid #d1d9e0; flex-shrink: 0; max-height: 30vh; overflow-y: auto; }
