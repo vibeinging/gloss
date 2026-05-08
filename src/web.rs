@@ -65,9 +65,11 @@ async fn bind_with_fallback(preferred: u16) -> Result<(tokio::net::TcpListener, 
     Ok((l, addr))
 }
 
-/// Deterministic port for a (workspace, label) pair so reopening the same
-/// session always lands on the same URL. Range: 7400–7999.
-pub fn port_for(workspace: &std::path::Path, label: Option<&str>) -> u16 {
+/// Deterministic port per workspace. Label is intentionally NOT mixed in:
+/// every Claude session for the same project shares one server + one
+/// browser tab; sessions are surfaced as in-page tabs. The `_label` arg
+/// is retained for API compatibility. Range: 7400–7999.
+pub fn port_for(workspace: &std::path::Path, _label: Option<&str>) -> u16 {
     let mut h: u64 = 0xcbf29ce484222325;
     let canon = workspace
         .canonicalize()
@@ -76,13 +78,6 @@ pub fn port_for(workspace: &std::path::Path, label: Option<&str>) -> u16 {
         h ^= *b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
-    if let Some(l) = label {
-        h ^= 0x1u64;
-        for b in l.as_bytes() {
-            h ^= *b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-    }
     7400 + ((h % 600) as u16)
 }
 
@@ -90,6 +85,33 @@ pub fn port_for(workspace: &std::path::Path, label: Option<&str>) -> u16 {
 struct IndexQuery {
     id: Option<String>,
     msg: Option<String>,
+    /// Session index, 0 = newest. Sessions are derived by splitting the
+    /// flat checkpoint timeline on idle gaps > SESSION_GAP_MS.
+    session: Option<usize>,
+}
+
+/// 30 minutes of inactivity = a new session.
+const SESSION_GAP_MS: u64 = 30 * 60 * 1000;
+
+/// Group a newest-first checkpoint list into sessions. Each inner Vec is
+/// itself newest-first within that session.
+fn group_sessions(cps: &[CheckpointInfo]) -> Vec<Vec<&CheckpointInfo>> {
+    let mut out: Vec<Vec<&CheckpointInfo>> = Vec::new();
+    for cp in cps {
+        let needs_new = match out.last() {
+            None => true,
+            Some(last) => {
+                let prev = last.last().unwrap();
+                prev.created_at_ms.saturating_sub(cp.created_at_ms) > SESSION_GAP_MS
+            }
+        };
+        if needs_new {
+            out.push(vec![cp]);
+        } else {
+            out.last_mut().unwrap().push(cp);
+        }
+    }
+    out
 }
 
 async fn index(
@@ -101,10 +123,21 @@ async fn index(
         .await
         .map_err(|e| AppError(format!("join: {e}")))?;
 
+    let sessions = group_sessions(&checkpoints);
+    let max_idx = sessions.len().saturating_sub(1);
+    let session_idx = q.session.unwrap_or(0).min(max_idx);
+    let visible: &[&CheckpointInfo] = sessions
+        .get(session_idx)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+
+    // Resolve the selected checkpoint: respect ?id= if it falls inside the
+    // visible session, else default to the newest in that session.
     let selected_id = q
         .id
         .clone()
-        .or_else(|| checkpoints.first().map(|c| c.id.clone()));
+        .filter(|id| visible.iter().any(|c| &c.id == id))
+        .or_else(|| visible.first().map(|c| c.id.clone()));
 
     let diffs = if let Some(id) = &selected_id {
         match diff(&state.workspace, id).await {
@@ -118,7 +151,8 @@ async fn index(
     Ok(Html(render_page(
         &state.workspace,
         state.label.as_deref(),
-        &checkpoints,
+        &sessions,
+        session_idx,
         selected_id.as_deref(),
         diffs.as_deref(),
         q.msg.as_deref(),
@@ -160,7 +194,8 @@ impl IntoResponse for AppError {
 fn render_page(
     workspace: &std::path::Path,
     label: Option<&str>,
-    checkpoints: &[CheckpointInfo],
+    sessions: &[Vec<&CheckpointInfo>],
+    session_idx: usize,
     selected: Option<&str>,
     diffs: Option<&[FileDiff]>,
     flash: Option<&str>,
@@ -193,26 +228,62 @@ fn render_page(
 
     out.push_str("<div class=\"layout\">");
 
-    out.push_str("<aside><h2>checkpoints</h2>");
-    if checkpoints.is_empty() {
+    out.push_str("<aside>");
+
+    // Session tabs at the top of the sidebar. Each tab represents a burst
+    // of activity (>30min idle = new session). Click to filter the
+    // checkpoint list below.
+    if !sessions.is_empty() {
+        out.push_str("<nav class=\"session-tabs\" title=\"sessions split by 30min idle gaps\">");
+        for (i, sess) in sessions.iter().enumerate() {
+            let active = if i == session_idx { " active" } else { "" };
+            let head = sess.first().unwrap();
+            let when = format_ts(head.created_at_ms);
+            // Prefer a meaningful label (anything other than auto turn-* tags)
+            // but fall back to the relative time.
+            let pretty_label = sess
+                .iter()
+                .filter_map(|c| c.label.as_deref())
+                .find(|l| !l.starts_with("turn-"))
+                .unwrap_or(&when);
+            let count = sess.len();
+            out.push_str(&format!(
+                "<a class=\"session-tab{active}\" href=\"/?session={i}\" title=\"{count} checkpoints\">\
+                <span class=\"st-label\">{label}</span>\
+                <span class=\"st-meta\">{when} · {count}</span>\
+                </a>",
+                active = active,
+                i = i,
+                count = count,
+                label = esc(pretty_label),
+                when = esc(&when),
+            ));
+        }
+        out.push_str("</nav>");
+    }
+
+    out.push_str("<div class=\"cps-wrap\"><h2>checkpoints</h2>");
+    let visible = sessions.get(session_idx).map(|v| v.as_slice()).unwrap_or(&[]);
+    if visible.is_empty() {
         out.push_str("<p class=\"empty\">no checkpoints yet — run <code>gloss snap</code></p>");
     } else {
         out.push_str("<ul class=\"cps\">");
-        for cp in checkpoints {
+        for cp in visible {
             let active = selected == Some(&cp.id);
             let cls = if active { "cp active" } else { "cp" };
-            let label = cp.label.as_deref().unwrap_or("(auto)");
+            let cp_label = cp.label.as_deref().unwrap_or("(auto)");
             let when = format_ts(cp.created_at_ms);
             let short = &cp.id[..cp.id.len().min(20)];
             out.push_str(&format!(
-                "<li class=\"{cls}\"><a href=\"/?id={id}\"><div class=\"cp-label\">{label}</div>\
+                "<li class=\"{cls}\"><a href=\"/?session={s}&id={id}\"><div class=\"cp-label\">{label}</div>\
                 <div class=\"cp-meta\">{when} · {fc} files · <span class=\"add\">+{ins}</span> <span class=\"del\">-{dels}</span></div>\
                 <div class=\"cp-id\">{short}</div></a>\
                 <form method=\"POST\" action=\"/restore/{id}\" onsubmit=\"return confirm('Restore workspace to this checkpoint? Current state will be auto-stashed.')\">\
                 <button class=\"restore\" title=\"Restore workspace to this checkpoint\">↶ restore</button></form></li>",
                 cls = cls,
+                s = session_idx,
                 id = esc(&cp.id),
-                label = esc(label),
+                label = esc(cp_label),
                 when = esc(&when),
                 fc = cp.files_changed,
                 ins = cp.insertions,
@@ -222,7 +293,7 @@ fn render_page(
         }
         out.push_str("</ul>");
     }
-    out.push_str("</aside>");
+    out.push_str("</div></aside>");
 
     out.push_str("<main>");
     if let Some(diffs) = diffs {
@@ -238,7 +309,7 @@ fn render_page(
                 out.push_str(&render_file_diff(fd));
             }
         }
-    } else if checkpoints.is_empty() {
+    } else if sessions.is_empty() {
         out.push_str("<p class=\"empty\">Take your first snapshot:<br><code>gloss snap \"before-claude\"</code></p>");
     } else {
         out.push_str("<p class=\"empty\">Select a checkpoint on the left.</p>");
@@ -348,8 +419,16 @@ header .badge { background: #2da44e; color: #fff; padding: 2px 10px; border-radi
 header .ws { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; opacity: 0.7; }
 .flash { padding: 10px 20px; background: #ddf4ff; border-bottom: 1px solid #b6e3ff; color: #0969da; }
 .layout { display: grid; grid-template-columns: 320px 1fr; height: calc(100vh - 45px); }
-aside { background: #fff; border-right: 1px solid #d1d9e0; overflow-y: auto; padding: 8px; }
+aside { background: #fff; border-right: 1px solid #d1d9e0; overflow-y: auto; display: flex; flex-direction: column; }
 aside h2 { margin: 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #59636e; }
+.session-tabs { display: flex; flex-direction: column; padding: 6px; gap: 3px; border-bottom: 1px solid #d1d9e0; flex-shrink: 0; max-height: 30vh; overflow-y: auto; }
+.session-tab { display: flex; flex-direction: column; padding: 7px 10px; border-radius: 5px; background: transparent; font-size: 12px; text-decoration: none; color: #1f2328; border-left: 3px solid transparent; line-height: 1.3; }
+.session-tab:hover { background: #f6f8fa; }
+.session-tab.active { background: #ddf4ff; border-left-color: #0969da; color: #0969da; }
+.session-tab .st-label { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.session-tab .st-meta { color: #59636e; font-size: 11px; }
+.session-tab.active .st-meta { color: #0969da; }
+.cps-wrap { padding: 8px; flex: 1; overflow-y: auto; }
 .cps { list-style: none; margin: 0; padding: 0; }
 .cp { position: relative; }
 .cp a { display: block; padding: 10px 12px; border-radius: 6px; color: inherit; text-decoration: none; border: 1px solid transparent; }
